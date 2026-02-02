@@ -1,53 +1,57 @@
 import os
-import PIL
-import numpy
-
-
-from numpy.lib.function_base import average
-
-
-from numpy import zeros
-from numpy import asarray
-
-from mrcnn.config import Config
-
-from mrcnn.model import MaskRCNN
-
-from skimage.draw import polygon2mask
-from skimage.io import imread
-
+import sys
+import json
+from io import BytesIO
 from datetime import datetime
 
+import tensorflow as tf
+tf.compat.v1.disable_eager_execution()
+
+from keras import backend as K
 
 
-from io import BytesIO
-from mrcnn.utils import extract_bboxes
-from numpy import expand_dims
+import PIL
+from PIL import Image
+import numpy
+from numpy import zeros, asarray, expand_dims
+import numpy as np
+
+
+
+
+from skimage import color
+
+
 from matplotlib import pyplot
 from matplotlib.patches import Rectangle
+
 from keras.backend import clear_session
-import json
-from flask import Flask, flash, request,jsonify, redirect, url_for
+
+from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
-
-from skimage.io import imread
-from mrcnn.model import mold_image
-
-import tensorflow as tf
-import sys
-
-from PIL import Image
+from flask_cors import CORS
 
 
 
+
+from mrcnn.config import Config
+from mrcnn.model import MaskRCNN, mold_image
+from mrcnn.utils import extract_bboxes
+
+
+tf.compat.v1.disable_eager_execution()
 
 global _model
 global _graph
 global cfg
+
+_graph = tf.compat.v1.Graph()
+_sess = tf.compat.v1.Session(graph=_graph)
+
+with _graph.as_default():
+    K.set_session(_sess)
 ROOT_DIR = os.path.abspath("./")
 WEIGHTS_FOLDER = "./weights"
-
-from flask_cors import CORS, cross_origin
 
 sys.path.append(ROOT_DIR)
 
@@ -69,30 +73,45 @@ class PredictionConfig(Config):
 	
 @application.before_first_request
 def load_model():
-	global cfg
-	global _model
-	model_folder_path = os.path.abspath("./") + "/mrcnn"
-	weights_path= os.path.join(WEIGHTS_FOLDER, WEIGHTS_FILE_NAME)
-	cfg=PredictionConfig()
-	print(cfg.IMAGE_RESIZE_MODE)
-	print('==============before loading model=========')
-	_model = MaskRCNN(mode='inference', model_dir=model_folder_path,config=cfg)
-	print('=================after loading model==============')
-	_model.load_weights(weights_path, by_name=True)
-	global _graph
-	_graph = tf.get_default_graph()
+    global _model, cfg
+
+    with _graph.as_default():
+        K.set_session(_sess)
+
+        model_folder_path = os.path.abspath("./") + "/mrcnn"
+        weights_path = os.path.join(WEIGHTS_FOLDER, WEIGHTS_FILE_NAME)
+
+        cfg = PredictionConfig()
+
+        print("Loading Mask R-CNN model...")
+        _model = MaskRCNN(
+            mode="inference",
+            model_dir=model_folder_path,
+            config=cfg
+        )
+
+        _model.load_weights(weights_path, by_name=True)
+        print("Model loaded successfully")
+
+	
+
 
 
 def myImageLoader(imageInput):
-	image =  numpy.asarray(imageInput)
-	
-	
-	h,w,c=image.shape 
-	if image.ndim != 3:
-		image = skimage.color.gray2rgb(image)
-		if image.shape[-1] == 4:
-			image = image[..., :3]
-	return image,w,h
+    image = np.asarray(imageInput)
+
+    # grayscale → RGB
+    if image.ndim == 2:
+        image = color.gray2rgb(image)
+
+    # RGBA → RGB
+    if image.shape[-1] == 4:
+        image = image[..., :3]
+
+    h, w, c = image.shape
+    return image, w, h
+
+
 
 def getClassNames(classIds):
 	result=list()
@@ -107,25 +126,39 @@ def getClassNames(classIds):
 		result.append(data)	
 
 	return result				
-def normalizePoints(bbx,classNames):
-	normalizingX=1
-	normalizingY=1
-	result=list()
-	doorCount=0
-	index=-1
-	doorDifference=0
-	for bb in bbx:
-		index=index+1
-		if(classNames[index]==3):
-			doorCount=doorCount+1
-			if(abs(bb[3]-bb[1])>abs(bb[2]-bb[0])):
-				doorDifference=doorDifference+abs(bb[3]-bb[1])
-			else:
-				doorDifference=doorDifference+abs(bb[2]-bb[0])
 
+def normalizePoints(bbx, class_ids):
+    result = []
+    doorHeights = []
 
-		result.append([bb[0]*normalizingY,bb[1]*normalizingX,bb[2]*normalizingY,bb[3]*normalizingX])
-	return result,(doorDifference/doorCount)	
+    # First pass – collect door sizes
+    for i, bb in enumerate(bbx):
+        if class_ids[i] == 3:  # door
+            height = abs(bb[2] - bb[0])
+            doorHeights.append(height)
+
+    avgDoor = np.mean(doorHeights) if doorHeights else 0
+
+    # Second pass – correct classes
+    corrected_classes = []
+
+    for i, bb in enumerate(bbx):
+        class_id = class_ids[i]
+        height = abs(bb[2] - bb[0])
+
+        # window → door
+        if class_id == 2 and avgDoor > 0 and height > avgDoor * 0.9:
+            class_id = 3
+
+        # door → window
+        if class_id == 3 and avgDoor > 0 and height < avgDoor * 0.75:
+            class_id = 2
+
+        corrected_classes.append(class_id)
+        result.append([bb[0], bb[1], bb[2], bb[3]])
+
+    return result, avgDoor, corrected_classes
+
 		
 
 def turnSubArraysToJson(objectsArr):
@@ -141,32 +174,47 @@ def turnSubArraysToJson(objectsArr):
 
 
 
-@application.route('/',methods=['POST'])
+@application.route('/', methods=['POST'])
 def prediction():
-	global cfg
-	imagefile = PIL.Image.open(request.files['image'].stream)
-	image,w,h=myImageLoader(imagefile)
-	print(h,w)
-	scaled_image = mold_image(image, cfg)
-	sample = expand_dims(scaled_image, 0)
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
 
-	global _model
-	global _graph
-	with _graph.as_default():
-		r = _model.detect(sample, verbose=0)[0]
-	
-	#output_data = model_api(imagefile)
-	
-	data={}
-	bbx=r['rois'].tolist()
-	temp,averageDoor=normalizePoints(bbx,r['class_ids'])
-	temp=turnSubArraysToJson(temp)
-	data['points']=temp
-	data['classes']=getClassNames(r['class_ids'])
-	data['Width']=w
-	data['Height']=h
-	data['averageDoor']=averageDoor
-	return jsonify(data)
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
+
+    try:
+        imagefile = Image.open(file.stream)
+        image, w, h = myImageLoader(imagefile)
+
+        scaled_image = mold_image(image, cfg)
+        sample = expand_dims(scaled_image, 0)
+
+        with _graph.as_default():
+            r = _model.detect(sample, verbose=0)[0]
+
+        bbx = r['rois'].tolist()
+        points, averageDoor, fixed_classes = normalizePoints(bbx, r['class_ids'])
+
+        return jsonify({
+    "points": turnSubArraysToJson(points),
+    "classes": getClassNames(fixed_classes),
+    "Width": w,
+    "Height": h,
+    "averageDoor": averageDoor,
+    "wallThickness": averageDoor * 0.15
+
+        })
+
+    except Exception as e:
+        print("ERROR:", e)
+        return jsonify({"error": str(e)}), 500
+
+@application.route('/ping', methods=['GET'])
+def ping():
+    return {"status": "server is running"}
+
+
 		
     
 if __name__ =='__main__':
