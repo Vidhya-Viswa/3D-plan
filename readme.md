@@ -104,8 +104,8 @@ For an in-depth exploration of the project, refer to the bachelor's thesis avail
 
 ## Author
 
-Fady Aziz Ibrahim
+Vidhya V
 
-Email: fady.aziz.ibrahim@gmail.com
+Email: vidhyaviswa20@gmail.com
 
-LinkedIn: [Fady Aziz](https://www.linkedin.com/in/fady-aziz-b40687163/)
+LinkedIn: www.linkedin.com/in/vidhya-viswa
